@@ -1257,17 +1257,101 @@ class Gemma4TextAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+        cache_position = kwargs.get("cache_position")
+        valid_kv_len = cache_position[-1] + 1 if cache_position is not None else key_states.shape[2]
+
+        if self.is_sliding and self.sliding_window is not None:
+            W = self.sliding_window
+            q_len = query_states.shape[2]
+
+            if self.config._attn_implementation == "sdpa" and q_len > 1:
+                # Prefill phase with SDPA: chunk over queries
+                if isinstance(valid_kv_len, torch.Tensor):
+                    valid_kv_len = valid_kv_len.item()
+
+                if valid_kv_len <= W:
+                    # Sequence fits entirely within window
+                    attn_output, attn_weights = attention_interface(
+                        self,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        dropout=self.attention_dropout if self.training else 0.0,
+                        scaling=self.scaling,
+                        sliding_window=self.sliding_window,
+                        **kwargs,
+                    )
+                else:
+                    attn_outputs = []
+                    for q_start in range(0, q_len, W):
+                        q_end = min(q_start + W, q_len)
+                        q_chunk = query_states[:, :, q_start:q_end, :]
+
+                        # Extract keys & values
+                        kv_end = valid_kv_len - q_len + q_end
+                        kv_start = max(0, kv_end - 2 * W)
+                        k_chunk = key_states[:, :, kv_start:kv_end, :]
+                        v_chunk = value_states[:, :, kv_start:kv_end, :]
+
+                        mask_q_len = q_end - q_start
+                        mask_kv_len = kv_end - kv_start
+
+                        window_mask = torch.ones((mask_q_len, mask_kv_len), dtype=torch.bool, device=q_chunk.device)
+                        window_mask = torch.triu(window_mask, diagonal=mask_kv_len - mask_q_len - W + 1)
+
+                        chunk_mask = None
+                        if attention_mask is not None:
+                            chunk_mask = attention_mask[..., q_start:q_end, kv_start:kv_end]
+                            chunk_mask = chunk_mask & window_mask.view(1, 1, mask_q_len, mask_kv_len)
+                        else:
+                            causal_mask = torch.ones(
+                                (mask_q_len, mask_kv_len), dtype=torch.bool, device=q_chunk.device
+                            )
+                            causal_mask = torch.tril(causal_mask, diagonal=mask_kv_len - mask_q_len)
+                            chunk_mask = (causal_mask & window_mask).view(1, 1, mask_q_len, mask_kv_len)
+
+                        kwargs_chunk = kwargs.copy()
+                        kwargs_chunk["is_causal"] = False
+                        out, _ = attention_interface(
+                            self,
+                            q_chunk,
+                            k_chunk,
+                            v_chunk,
+                            chunk_mask,
+                            dropout=self.attention_dropout if self.training else 0.0,
+                            scaling=self.scaling,
+                            sliding_window=None,
+                            **kwargs_chunk,
+                        )
+                        attn_outputs.append(out)
+
+                    attn_output = torch.cat(attn_outputs, dim=1)
+                    attn_weights = None
+            else:
+                attn_output, attn_weights = attention_interface(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    dropout=self.attention_dropout if self.training else 0.0,
+                    scaling=self.scaling,
+                    sliding_window=self.sliding_window,
+                    **kwargs,
+                )
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=self.attention_dropout if self.training else 0.0,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

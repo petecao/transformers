@@ -1953,8 +1953,8 @@ def create_modules(
 
 def run_ruff(file: str):
     """Run `ruff` linter and formatter on `file`, as in `make style`"""
-    subprocess.run(["ruff", "check", file, "--fix"], stdout=subprocess.DEVNULL)
-    subprocess.run(["ruff", "format", file], stdout=subprocess.DEVNULL)
+    subprocess.run(["python", "-m", "ruff", "check", file, "--fix"], stdout=subprocess.DEVNULL)
+    subprocess.run(["python", "-m", "ruff", "format", file], stdout=subprocess.DEVNULL)
 
 
 def convert_modular_file(modular_file: str, source_library: str | None = "transformers") -> dict[str, str]:
